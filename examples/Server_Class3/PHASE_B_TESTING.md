@@ -1,18 +1,20 @@
 # Phase B testing — gologix server STRING handling (issue #58)
 
-This document tells the automation team **exactly** how to validate the fix on
-branch `fix/server-string-handling`. The fix touches how the gologix CIP server
-serializes and parses Logix `STRING` UDTs (`LEN: DINT, DATA: SINT[82]`,
+This document tells the automation team **exactly** how to validate the fix
+on branch `fix/server-string-handling`. The fix touches how the gologix CIP
+server serializes and parses Logix `STRING` UDTs (`LEN: DINT, DATA: SINT[82]`,
 StructTypeCRC `0x0FCE`) when external CIP clients (Studio 5000 MSG, Kepware,
-Ignition, pylogix) read from or write to a gologix server.
+FactoryTalk, Ignition, pylogix) read from or write to a gologix server.
 
-Phase A (this branch) is already validated against pylogix as an external
-client (`pylogix_interop.py`). Phase B is what you are about to do: replace
-pylogix with a **real Rockwell controller** sending MSG instructions, and
-optionally a SCADA stack (Kepware / Ignition / FactoryTalk).
+Phase A is already validated against `pylogix` as an external client (see
+`pylogix_interop.py`). Phase B is what you are about to do: replace pylogix
+with a **real Rockwell controller** sending MSG instructions, and optionally
+a SCADA stack.
 
-If anything in this doc is unclear, ping back with the failing step instead of
-guessing. The criteria below are binary — pass or fail — by design.
+Each scenario has a binary pass / fail. If a step fails, stop and report it
+with the failing tag value, the gologix server log line, and (ideally) a
+Wireshark `.pcapng` filtered on `enip`. Do **not** patch the server code
+locally — send the evidence back and we iterate.
 
 ---
 
@@ -20,199 +22,217 @@ guessing. The criteria below are binary — pass or fail — by design.
 
 ### Hardware
 
-- 1 × ControlLogix or CompactLogix controller running v20+ firmware.
+- 1 × ControlLogix or CompactLogix controller with firmware ≥ 20.
 - Network reachable between the controller and the host that will run the
-  gologix server (any laptop / PC / VM is fine).
-- Studio 5000 Logix Designer (for loading the L5X and running MSG online).
-- *(Optional, only if you also want to validate SCADA path)* Kepware
-  KEPServerEX, Ignition with the Allen-Bradley Logix driver, or
-  FactoryTalk Linx — any one is enough.
+  gologix server.
+- Studio 5000 Logix Designer v32 or later (for importing the L5X).
+- *(Test C only)* FactoryTalk View / Ignition / any SCADA stack with an
+  EtherNet/IP driver.
 
 ### Software on the gologix host
 
-- Go 1.21 or later (`go version` should print 1.21+).
+- Go 1.21 or later (`go version`).
 - This branch checked out:
   ```bash
-  git clone https://github.com/marioser/gologix
+  git clone https://github.com/marioser/gologix.git
   cd gologix
   git checkout fix/server-string-handling
+  go build -o /tmp/gologix-server ./examples/Server_Class3/
   ```
+  For Windows: `GOOS=windows GOARCH=amd64 go build -o gologix-server.exe ./examples/Server_Class3/`.
 
 ### Network
 
-- The gologix server listens on **TCP/UDP 44818** (standard EtherNet/IP).
-  No firewall between the controller and the host on that port.
-- The host running gologix needs a static IP the controller can reach.
-- The example uses CIP path `1,0` (backplane, slot 0) for the first
-  provider and `1,1` (backplane, slot 1) for the second. The MSG
-  instruction's **Connection Path** is what selects which provider, not
-  the IP.
+- TCP 44818 and UDP 2222 open between the controller, the SCADA host, and
+  the gologix host.
+- The gologix host needs a static IP reachable from the PLC. Note this IP
+  — it goes in the MSG Communication path.
+- The gologix host **cannot** have another EtherNet/IP server or a Logix
+  emulator on the same machine; the server binds 44818 unconditionally.
+  Use a VM or LXC if FactoryTalk Linx already owns 44818 on your main
+  workstation.
 
 ---
 
-## 2. Tags to create on the controller
-
-Open the L5X import dialog and add (or create manually) these tags. The names
-and types are not negotiable — the validation steps reference them literally.
-
-| Tag name              | Type        | Initial value          | Used for                  |
-|-----------------------|-------------|------------------------|---------------------------|
-| `gologixTestString`   | `STRING`    | `"Hello World"`        | Read test (scalar STRING) |
-| `gologixWriteTarget`  | `STRING`    | empty                  | Write test (round-trip)   |
-| `msgRead`             | `MESSAGE`   | see config below       | Triggers CIP Data Read    |
-| `msgWrite`            | `MESSAGE`   | see config below       | Triggers CIP Data Write   |
-
-### MSG instruction config — `msgRead`
-
-Configure on the **Configuration** tab:
-
-| Field                   | Value                                |
-|-------------------------|--------------------------------------|
-| Message Type            | CIP Data Table Read                  |
-| Source Element          | `teststring`                         |
-| Number Of Elements      | `1`                                  |
-| Destination Element     | `gologixTestString`                  |
-
-On the **Communication** tab:
-
-| Field            | Value                                                          |
-|------------------|----------------------------------------------------------------|
-| Path             | `<gologix_host_ip>, 1, 0`                                      |
-| Connected        | ☑ (checked — class 3 connected MSG)                            |
-| Cache Connections| ☐ (unchecked is fine; either works)                            |
-
-Replace `<gologix_host_ip>` with the IP of the machine running `go run .`.
-
-### MSG instruction config — `msgWrite`
-
-| Field                   | Value                                |
-|-------------------------|--------------------------------------|
-| Message Type            | CIP Data Table Write                 |
-| Source Element          | `gologixWriteTarget`                 |
-| Number Of Elements      | `1`                                  |
-| Destination Element     | `writestring`                        |
-
-Communication tab: same as `msgRead`.
-
----
-
-## 3. Start the gologix server
-
-On the host machine, from the repo root:
+## 2. Start the gologix server
 
 ```bash
-cd examples/Server_Class3
-go run .
+/tmp/gologix-server 2>&1 | tee /tmp/gologix-server.log
 ```
 
-Expected console output every 5 seconds (sanity ticker):
+Expected output in the first few seconds:
 
 ```
-2026/05/17 10:00:00 Data 1: map[testdint:12 testint:3 teststring:Hello World testtag1:12345 testtag2:543.21 testtag3:[1 2 3 4 5 6 7 8 9 10] writestring:]
-2026/05/17 10:00:00 Data 2: map[]
+INFO Listening on TCP port 44818
+INFO Listening on UDP port 2222
+... (every 5s) Data 1: map[testdint:12 testint:3 teststring:Hello World ... writestring:]
 ```
 
-Leave this terminal running. If you see `bind: address already in use`, port
-44818 is busy — close any other CIP server / pylogix script / Wireshark
-capture-with-replay process and retry.
+Leave this running. Record the host IP — the MSG path uses it.
 
 ---
 
-## 4. Validation scenarios
+## 3. Import the L5X into Studio 5000
 
-Run these **in order**. Each one has a binary pass/fail. If a step fails, stop
-and report it with the failing tag value, the gologix server log line, and a
-Wireshark capture if you have one (filter `enip`).
+The L5X file `gologix_phase_b_tags.L5X` ships attached to the internal
+ticket (SMBX-270 for the SGS automation team; if you do not have access,
+request it from the contributor).
 
-### Scenario B1 — Scalar STRING read from a real controller
-
-1. In Studio 5000, set the controller to **Run mode**.
-2. Trigger `msgRead` (force the rung true, or manually toggle the `.EN` bit).
-3. **Pass criteria:**
-   - `msgRead.DN` becomes 1 (done).
-   - `msgRead.ER` stays 0 (no error).
-   - `gologixTestString` in the controller shows `Hello World` (LEN=11, DATA
-     contains the ASCII bytes, the rest of the 82-byte DATA buffer is 0x00).
-4. **Fail criteria:**
-   - `msgRead.ER == 1` with `.EXERR` set. Capture the EXERR hex value.
-   - `gologixTestString.LEN != 11` or DATA bytes differ.
-
-### Scenario B2 — Scalar STRING write from a real controller
-
-1. In Studio 5000, set `gologixWriteTarget.LEN` and `.DATA` to a non-empty
-   value (e.g. `"phase-b-roundtrip"` — LEN=17).
-2. Trigger `msgWrite`.
-3. **Pass criteria:**
-   - `msgWrite.DN == 1`, `.ER == 0`.
-   - In the gologix server console, the next 5-second tick shows
-     `writestring:phase-b-roundtrip` inside the `Data 1: map[...]` log line.
-4. **Fail criteria:**
-   - `.ER == 1` (capture EXERR).
-   - The server log shows `writestring:` empty or with truncated/garbled
-     content.
-
-### Scenario B3 — Write then read-back round-trip
-
-1. After B2 succeeds, run `msgRead` but with **Source Element** temporarily
-   changed to `writestring` (instead of `teststring`).
-2. **Pass criteria:**
-   - The controller's `gologixTestString` now shows the value you wrote in
-     B2 (`phase-b-roundtrip`).
-3. **Fail criteria:**
-   - Mismatch between what you wrote and what comes back.
-
-### Scenario B4 — Stress / repeated triggers
-
-1. Trigger `msgRead` 20 times in quick succession (a counter + loop, or a
-   timed rung).
-2. **Pass criteria:**
-   - All 20 messages report `.DN == 1`, no `.ER`.
-   - No memory growth or hang on the gologix server (it should respond
-     under 50ms per request on a local network).
-3. **Fail criteria:**
-   - Any single message ER==1, or the server becomes unresponsive.
-
-### Scenario B5 *(optional, only if SCADA is in scope)* — SCADA client read
-
-Configure your SCADA stack (Kepware/Ignition/FactoryTalk) to point at the
-gologix host IP, slot 0. Add tags `teststring` and `writestring`. Subscribe
-both.
-
-- **Pass criteria:** SCADA shows the current string values, updates within
-  the polling interval after a `msgWrite`.
-- **Fail criteria:** SCADA reports a quality bad / type mismatch / connection
-  error.
+1. Open your PLC project.
+2. **File → Import → Import Component → select `gologix_phase_b_tags.L5X`**.
+3. Import as **Controller Tags**. The L5X adds:
+   - `gologix_src_string` (STRING) — pre-loaded with the test value
+     `pylogix-round-trip-from-PLC` (LEN=27).
+   - `gologix_dst_string` (STRING) — empty buffer for read responses.
+   - `msg_read_test_string`, `msg_write_writestring`, `msg_read_writestring_back`
+     (MESSAGE) — three MSG control tags.
+   - `trig_msg_read_test_string`, `trig_msg_write_writestring`,
+     `trig_msg_read_writestring_back` (BOOL) — three trigger latches to fire
+     each MSG manually from the online editor.
 
 ---
 
-## 5. How to report results
+## 4. Configure each MESSAGE tag
 
-Open a comment on the internal ticket **SMBX-270** with:
+Right-click each MSG tag → **Configure**. **Configuration** tab:
 
-1. Pass/fail per scenario (B1–B5).
-2. Controller model + firmware version (`Properties → General` in Studio 5000).
-3. gologix host OS + Go version.
-4. For any failure: the failing tag value, the relevant gologix server log
-   line, and (ideally) a `.pcapng` capture of the failing exchange.
+| Tag MSG | Message Type | Source Element | # Elements | Destination Element |
+|---|---|---|---|---|
+| `msg_read_test_string` | CIP Data Table Read | `teststring` | 1 | `gologix_dst_string` |
+| `msg_write_writestring` | CIP Data Table Write | `gologix_src_string` | 1 | `writestring` |
+| `msg_read_writestring_back` | CIP Data Table Read | `writestring` | 1 | `gologix_dst_string` |
 
-If everything passes, that's the green light to push the PR upstream to
-`danomagnum/gologix`. **Do not comment on the upstream issue #58 directly** —
-all coordination stays on SMBX-270 until we open the PR.
+**Communication** tab (same for all three):
+
+| Field | Value |
+|---|---|
+| Path | `<gologix_host_ip>, 1, 0` (e.g. `192.168.1.50, 1, 0`) |
+| Communication Method | `CIP` |
+| Connected | ☑ |
+| Cache Connections | ☑ |
+
+The `1, 0` after the IP is the internal CIP path the example uses to
+distinguish providers on the same server (virtual backplane, slot 0). The
+`Server_Class3` example puts everything in that slot.
 
 ---
 
-## 6. Quick reference — wire details the fix enforces
+## 5. Add three trigger rungs to a continuous task routine
 
-For Wireshark / packet-analysis sanity:
+```ladder
+| trig_msg_read_test_string         MSG(msg_read_test_string)         |
+| trig_msg_write_writestring        MSG(msg_write_writestring)        |
+| trig_msg_read_writestring_back    MSG(msg_read_writestring_back)    |
+```
 
-- A Logix `STRING` UDT on the wire is **`type segment (4 bytes: 0xA0 0x02
-  0xCE 0x0F)` + `LEN (DINT, 4 bytes)` + `DATA (SINT[82], 82 bytes)` = 90
-  bytes total per element**.
-- StructTypeCRC for `STRING` is `0x0FCE` (little-endian on the wire: `CE 0F`).
+Download to the PLC. Put it in **Run**.
+
+---
+
+## 6. Validation scenarios
+
+Run **in order**. Each scenario produces evidence — keep screenshots and
+log excerpts attached to the ticket.
+
+### Test A — Read a STRING from the gologix server
+
+1. Confirm `gologix_dst_string` is empty (`LEN=0`, DATA all `$00`).
+2. Set `trig_msg_read_test_string = 1`.
+3. Wait for `msg_read_test_string.DN = 1` (should be immediate).
+4. **Capture** Studio 5000 showing `gologix_dst_string` with `LEN = 11`
+   and DATA = `Hello World`.
+5. If `.ER = 1`: capture `msg_read_test_string.ERR` and `.EXERR` (CIP
+   status codes).
+6. Return the trigger to 0.
+
+**Pass criteria:** `gologix_dst_string == "Hello World"`, `LEN = 11`,
+`.ER = 0`.
+
+### Test B — Write a STRING + read it back
+
+1. Set `trig_msg_write_writestring = 1`. Wait for `.DN`.
+2. In the `gologix-server.log` console, the next 5-second tick must show:
+   ```
+   Data 1: map[... writestring:pylogix-round-trip-from-PLC ...]
+   ```
+   `writestring` flipped from empty to the value that was pre-loaded in
+   `gologix_src_string`.
+3. **Capture** the server log line.
+4. Return the trigger to 0.
+5. Set `trig_msg_read_writestring_back = 1`. Wait for `.DN`.
+6. **Capture** Studio 5000 showing
+   `gologix_dst_string = "pylogix-round-trip-from-PLC"`.
+
+**Pass criteria:** server log shows the written value, MSG read-back
+returns the same value, all three `.ER = 0`.
+
+### Test C — SCADA Rockwell *(optional but recommended)*
+
+1. In FactoryTalk View Studio (or your SCADA), create a new Data Server /
+   Topic pointing at the gologix host IP with path `1, 0`.
+2. Browse the tags. At minimum `teststring`, `writestring`, `testdint`,
+   `testint`, `testtag1`, `testtag2`, `testtag3` (DINT array) must show
+   up.
+3. Create a display with an input field bound to `writestring`.
+4. From the SCADA, write a distinct value, e.g. `scada-write-test`.
+5. **Capture** the server log showing `writestring:scada-write-test`.
+6. **Capture** the SCADA reading `writestring` back and showing the new
+   value.
+
+**Pass criteria:** SCADA reads and writes complete with good quality, no
+type-mismatch errors on either side.
+
+### Test D — Stress *(optional, useful if you have time)*
+
+Trigger `msg_read_test_string` 20 times in quick succession (counter +
+timed rung, or manual toggling).
+
+**Pass criteria:** all 20 messages `.DN = 1`, no `.ER`, gologix server
+keeps responding under ~50 ms per request on a local network.
+
+---
+
+## 7. Collect evidence
+
+Attach to the internal ticket (or shared folder, depending on team
+process):
+
+- `gologix-server.log` from server start through the last test.
+- Studio 5000 screenshots (Tests A, B).
+- FactoryTalk / SCADA screenshots (Test C).
+- Any `.ERR` / `.EXERR` values for failed MSGs.
+- *(Optional)* `.pcapng` capture filtered on `enip` if something fails on
+  the wire.
+
+---
+
+## 8. Acceptance criteria
+
+- [ ] Test A: `gologix_dst_string == "Hello World"` after the MSG read.
+- [ ] Test B: server log shows `writestring:pylogix-round-trip-from-PLC`
+      and read-back returns the same value.
+- [ ] Test C: SCADA reads and writes `writestring` cleanly.
+- [ ] Zero `.ER = 1` on any of the three MSG tags.
+- [ ] Zero `ERROR`-level lines in `gologix-server.log` during the tests.
+
+When all four boxes are green, this is the signal to push the PR upstream
+to `danomagnum/gologix`. **Do not comment on upstream issue #58 directly**
+— all coordination stays on the internal ticket until we open the PR.
+
+---
+
+## 9. Wire-level reference (for `.pcapng` triage)
+
+If you capture packets:
+
+- A Logix `STRING` UDT on the wire is **4-byte type segment
+  (`0xA0 0x02 0xCE 0x0F`) + `LEN (DINT, 4 bytes)` + `DATA (SINT[82], 82
+  bytes)` = 90 bytes per element**.
+- StructTypeCRC for `STRING` is `0x0FCE` (little-endian on the wire: `CE
+  0F`).
 - The read response service code must echo the request service: `0xCC`
-  (Read|Response) for `0x4C` Read, `0xD2` (FragRead|Response) for `0x52`
-  FragRead. A mismatch will cause MSG `.ER` with EXERR `0x16` (Object Does
-  Not Exist) or similar on stricter stacks.
+  (Read | Response) for `0x4C` Read, `0xD2` (FragRead | Response) for
+  `0x52` FragRead. Mismatch causes `.ER` with EXERR `0x16` (Object Does
+  Not Exist) on stricter stacks.
 
-If a capture shows DATA shorter than 82 bytes, or LEN > 82, that's a wire
-bug — file it under SMBX-270.
+DATA shorter than 82 bytes, or LEN > 82, is a wire bug — report it.
