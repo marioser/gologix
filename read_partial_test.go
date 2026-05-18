@@ -416,13 +416,76 @@ func TestReadPartialTransfer(t *testing.T) {
 	}
 }
 
-// TestReadPartialTransferStructIsRejected locks in the explicit scope guard:
-// when the first response indicates a structured tag type (Type=0xA0) AND
-// status=0x06, Read_single must surface a clear error instead of attempting
-// the FragRead loop. Struct partial transfer requires per-fragment
-// StructHandle deduplication that this PR does not implement; surfacing an
-// error keeps callers from silently consuming corrupt bytes.
-func TestReadPartialTransferStructIsRejected(t *testing.T) {
+// structFragment describes one server-side response in a struct multi-fragment
+// exchange. handle is the 2-byte StructHandle that controllers repeat at
+// the start of every FragRead response — that repetition is exactly what
+// the readFragmented loop has to dedupe. data is the slice of actual tag
+// data the fragment carries, without the handle prefix.
+type structFragment struct {
+	status byte
+	handle [2]byte
+	data   []byte
+}
+
+// serveStructFragments drives the server side of a multi-fragment struct
+// read. It enforces the offset contract for the CIP Read Tag Fragmented
+// service: each FragRead request's offset must equal the cumulative count
+// of DATA bytes delivered so far (handle bytes are NOT included in the
+// offset, because the handle is metadata wrapping the data, not part of
+// the addressable tag-data stream).
+func serveStructFragments(t *testing.T, fs *fakeCIPServer, fragments []structFragment) {
+	t.Helper()
+	var deliveredData uint32
+	for i, frag := range fragments {
+		req := fs.awaitRequest(time.Second)
+		if i == 0 {
+			if req.service != CIPService_Read {
+				t.Errorf("fragment 0: expected service Read, got %v", req.service)
+				return
+			}
+		} else {
+			if req.service != CIPService_FragRead {
+				t.Errorf("fragment %d: expected service FragRead, got %v", i, req.service)
+				return
+			}
+			if req.offset != deliveredData {
+				t.Errorf("fragment %d: expected offset %d (data bytes so far), got %d", i, deliveredData, req.offset)
+				return
+			}
+		}
+		// Wire payload after Type+Unknown: [StructHandle 2 bytes][data].
+		payload := make([]byte, 0, 2+len(frag.data))
+		payload = append(payload, frag.handle[0], frag.handle[1])
+		payload = append(payload, frag.data...)
+		fs.replyConnectedRead(req.service, req.seq, frag.status, CIPTypeStruct, payload)
+		deliveredData += uint32(len(frag.data))
+	}
+}
+
+// TestReadPartialTransferStruct exercises the FragRead loop for structured
+// tag types (Type=0xA0). The controller repeats the 2-byte StructHandle at
+// the start of every fragment response; the loop must dedupe those repeats
+// so the assembled payload comes out as [handle once][all data bytes],
+// which is the shape the existing per-type parser in Read_single expects.
+// FragRead offset must count delivered DATA bytes only, not the handle.
+func TestReadPartialTransferStruct(t *testing.T) {
+	const handleLo, handleHi byte = 0xCE, 0x0F // matches Logix STRING UDT StructTypeCRC
+	frag1Data := make([]byte, 20)
+	for i := range frag1Data {
+		frag1Data[i] = byte(0xA0 + i)
+	}
+	frag2Data := make([]byte, 10)
+	for i := range frag2Data {
+		frag2Data[i] = byte(0xB0 + i)
+	}
+	frag3Data := []byte{0xF0, 0xF1, 0xF2, 0xF3, 0xF4}
+
+	fragments := []structFragment{
+		{status: byte(CIPStatus_PartialTransfer), handle: [2]byte{handleLo, handleHi}, data: frag1Data},
+		{status: byte(CIPStatus_PartialTransfer), handle: [2]byte{handleLo, handleHi}, data: frag2Data},
+		{status: 0x00, handle: [2]byte{handleLo, handleHi}, data: frag3Data},
+	}
+
 	client, fs := newFakeCIPClient(t)
 
 	type result struct {
@@ -431,42 +494,38 @@ func TestReadPartialTransferStructIsRejected(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		v, e := client.Read_single("MyStructArray", CIPTypeStruct, 4)
+		v, e := client.Read_single("BigStruct", CIPTypeStruct, 1)
 		done <- result{v, e}
 	}()
 
-	// Reply with status=0x06 and a struct type marker (Type=0xA0). The data
-	// portion is arbitrary — the guard fires before any byte parsing.
-	req := fs.awaitRequest(time.Second)
-	if req.service != CIPService_Read {
-		t.Fatalf("expected service Read, got %v", req.service)
-	}
-	fs.replyConnectedRead(CIPService_Read, req.seq, byte(CIPStatus_PartialTransfer), CIPTypeStruct, []byte{0xCE, 0x0F, 0x01, 0x02, 0x03})
+	serveStructFragments(t, fs, fragments)
 
 	select {
 	case r := <-done:
-		if r.err == nil {
-			t.Fatalf("expected struct partial-transfer to be rejected, got value %v", r.val)
+		if r.err != nil {
+			t.Fatalf("unexpected error: %v", r.err)
 		}
-		if !contains(r.err.Error(), "structured tag types are not yet supported") {
-			t.Errorf("error message did not mention scope guard: %v", r.err)
+		got, ok := r.val.([]byte)
+		if !ok {
+			t.Fatalf("expected []byte, got %T", r.val)
+		}
+		// Read_single's struct path consumes the 2-byte StructHandle via
+		// cipStructHeader and returns the remaining tag-data bytes. So
+		// the visible result must be exactly the concatenation of the
+		// data slices, with no leftover handle bytes interleaved.
+		want := append([]byte(nil), frag1Data...)
+		want = append(want, frag2Data...)
+		want = append(want, frag3Data...)
+		if len(got) != len(want) {
+			t.Fatalf("got %d bytes, want %d", len(got), len(want))
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("byte %d: got 0x%02X, want 0x%02X", i, got[i], want[i])
+			}
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Read_single hung instead of returning the scope-guard error")
+		t.Fatal("Read_single hung")
 	}
 }
 
-// contains is a tiny substring helper to keep error-message assertions readable
-// without importing strings into every test case.
-func contains(s, substr string) bool {
-	return len(substr) == 0 || (len(s) >= len(substr) && indexOf(s, substr) >= 0)
-}
-
-func indexOf(s, substr string) int {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
-}

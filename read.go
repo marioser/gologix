@@ -461,16 +461,13 @@ func (client *Client) Read_single(tag string, datatype CIPType, elements uint16)
 	// follow up with FragRead requests until the controller returns 0x00. Any
 	// other non-zero general status is a hard error to surface immediately.
 	if hdr2.Status[1] == byte(CIPStatus_PartialTransfer) {
-		// Struct tag-data carries a 2-byte StructHandle that the controller
-		// repeats in every FragRead response; deduplicating that across
-		// fragments needs wire evidence we do not have yet, so refuse the
-		// operation explicitly instead of returning garbled bytes. Atomic
-		// types splice cleanly because their Tag Data has no per-fragment
-		// prefix.
-		if hdr2.Type == CIPTypeStruct {
-			return nil, fmt.Errorf("partial transfer read of %s: structured tag types are not yet supported in fragmented reads", tag)
-		}
-		merged, err := client.readFragmented(ioi, elements, items[1].Data[items[1].Pos:])
+		// readFragmented handles both atomic and struct types. Structs
+		// carry a 2-byte StructHandle at the start of the tag data that
+		// the controller repeats on every FragRead reply; the helper
+		// peels those repeats off so the assembled payload comes out as
+		// [handle once][all data bytes], matching what the per-type
+		// parser below already expects for a non-fragmented struct read.
+		merged, err := client.readFragmented(ioi, elements, hdr2.Type == CIPTypeStruct, items[1].Data[items[1].Pos:])
 		if err != nil {
 			return nil, fmt.Errorf("partial transfer read of %s: %w", tag, err)
 		}
@@ -1156,28 +1153,68 @@ func (client *Client) ReadMap(m map[string]any) error {
 	return nil
 }
 
+// cipStructHandleLen is the byte width of the StructHandle that prefixes
+// every structured Read Tag response and gets repeated at the start of
+// every FragRead continuation. Controllers tag the same value on every
+// fragment so the originator can re-verify the type mid-stream; for our
+// purposes we keep one copy on the assembled buffer and drop the rest.
+const cipStructHandleLen = 2
+
 // readFragmented completes a partial-transfer read by emitting FragRead
-// (CIPService_FragRead, 0x52) requests with a cumulative byte offset until the
-// controller returns CIPStatus_OK. initialData is the data portion that
-// arrived with the first (non-FragRead) response — the returned slice is the
-// full concatenation of every fragment's data section, ready to feed into the
-// existing per-type parsing path.
-func (client *Client) readFragmented(ioi *tagIOI, elements uint16, initialData []byte) ([]byte, error) {
-	accumulated := bytes.NewBuffer(append([]byte(nil), initialData...))
+// (CIPService_FragRead, 0x52) requests with a cumulative byte offset until
+// the controller returns CIPStatus_OK. initialData is the bytes that
+// arrived after hdr2 in the first (non-FragRead) response.
+//
+// For atomic types the bytes are plain tag data — every fragment is
+// concatenated as-is and the running offset equals the accumulator length.
+//
+// For structured types the controller wraps every fragment with the same
+// 2-byte StructHandle right after hdr2. The first occurrence is kept on
+// the assembled buffer so the existing per-type parser can read it via
+// cipStructHeader / cipStringHeader; subsequent repeats are stripped so
+// the inner tag-data stream stays contiguous. The FragRead offset is the
+// cumulative count of DATA bytes delivered (handle bytes excluded) —
+// that is what the CIP Read Tag Fragmented Service mandates for the
+// continuation address.
+func (client *Client) readFragmented(ioi *tagIOI, elements uint16, isStruct bool, initialData []byte) ([]byte, error) {
+	var handlePrefix []byte
+	dataOnly := bytes.NewBuffer(nil)
+
+	if isStruct && len(initialData) >= cipStructHandleLen {
+		handlePrefix = append([]byte(nil), initialData[:cipStructHandleLen]...)
+		dataOnly.Write(initialData[cipStructHandleLen:])
+	} else {
+		dataOnly.Write(initialData)
+	}
+
 	for {
-		offset := uint32(accumulated.Len())
+		offset := uint32(dataOnly.Len())
 		fragData, status, err := client.sendFragReadRequest(ioi, elements, offset)
 		if err != nil {
 			return nil, err
 		}
-		accumulated.Write(fragData)
+		if isStruct {
+			if len(fragData) < cipStructHandleLen {
+				return nil, fmt.Errorf("FragRead at offset %d returned %d bytes; expected at least the %d-byte StructHandle", offset, len(fragData), cipStructHandleLen)
+			}
+			fragData = fragData[cipStructHandleLen:]
+		}
+		dataOnly.Write(fragData)
 		if status == 0 {
-			return accumulated.Bytes(), nil
+			break
 		}
 		if status != byte(CIPStatus_PartialTransfer) {
 			return nil, fmt.Errorf("FragRead at offset %d returned status %v", offset, CIPStatus(status))
 		}
 	}
+
+	if isStruct {
+		assembled := make([]byte, 0, len(handlePrefix)+dataOnly.Len())
+		assembled = append(assembled, handlePrefix...)
+		assembled = append(assembled, dataOnly.Bytes()...)
+		return assembled, nil
+	}
+	return dataOnly.Bytes(), nil
 }
 
 // sendFragReadRequest emits a single FragRead request for the given tag IOI,
